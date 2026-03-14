@@ -4,12 +4,25 @@
 
 We've discovered that the MT7927 is architecturally identical to the MT7925 (which has full Linux support since kernel 6.7) except for 320MHz channel width capability. This means we can adapt the existing mt7925 driver rather than writing one from scratch!
 
-## Current Status: ON-HOLD INDEFINITELY 🚧
+## Current Status: PATCHED - CBInfra Init Implemented
 
-**Working**: Custom driver successfully binds to MT7927 hardware and loads firmware  
-**Next Step**: Implement DMA firmware transfer to activate the chip  
+**Working**: CBTOP remap, DMA ring setup (correct MT7927 layout), firmware loading via DMA
+**Registers as**: `mt7927` (visible in `lspci -k`, not mt7925e)
+**Next Step**: mac80211 integration for full WiFi functionality
 
-I have other projects that I am working on, so I probably won't continue work on this one. I'm sharing my work in case anyone finds it useful.
+### What was fixed
+The original driver was stuck because MT7927 has a **CBInfra bus fabric** that must be
+initialized before any DMA or MCU access. Without CBTOP remap, all WFDMA register writes
+are silently ignored. This knowledge comes from the
+[jetm/mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms) 18-patch series.
+
+Key fixes applied:
+1. **CBTOP remap** — CBInfra bus fabric initialization (the main blocker)
+2. **Correct firmware** — MT6639-based firmware, not MT7925
+3. **DMA ring layout** — RX rings at 4/6/7 (not 0/1/2 like MT7925)
+4. **Prefetch config** — MT7927-specific register values
+5. **ASPM disabled** — Prevents PCIe power management throughput issues
+6. **DBDC awareness** — 5GHz requires explicit dual-band enable
 
 ## Quick Start
 
@@ -24,32 +37,36 @@ lspci -nn | grep 14c3:7927  # Should show your device
 
 ### Install Firmware
 ```bash
-# Download MT7925 firmware (compatible with MT7927!)
-mkdir -p ~/mt7927_firmware
-cd ~/mt7927_firmware
-
-wget https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin
-wget https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin
+# MT7927 needs MT6639-based firmware (NOT MT7925 firmware!)
+# Get the ASUS driver package which contains the correct firmware:
+cd /tmp
+git clone https://github.com/jetm/mediatek-mt7927-dkms.git
+cd mediatek-mt7927-dkms
+./download-driver.sh .
+python3 extract_firmware.py DRV_WiFi_MTK_MT7925_MT7927*.zip /tmp/mt7927_fw
 
 # Install firmware
-sudo mkdir -p /lib/firmware/mediatek/mt7925
-sudo cp *.bin /lib/firmware/mediatek/mt7925/
+sudo mkdir -p /lib/firmware/mediatek/mt7927
+sudo cp /tmp/mt7927_fw/WIFI_*.bin /lib/firmware/mediatek/mt7927/
 sudo update-initramfs -u
 ```
 
 ### Build and Load Driver
 ```bash
 # Clone and build
-git clone https://github.com/[your-username]/mt7927-linux-driver
-cd mt7927-linux-driver
-make clean && make tests
+git clone https://github.com/aabdelghani/mt7927.git
+cd mt7927
+make driver
+
+# Unload any existing mt76 drivers first
+sudo modprobe -r mt7925e mt7921e mt76 2>/dev/null
 
 # Load the driver
-sudo insmod tests/04_risky_ops/mt7927_init.ko
+sudo insmod src/mt7927.ko
 
-# Check status
-sudo dmesg | tail -20
-lspci -k | grep -A 3 "14c3:7927"  # Should show "Kernel driver in use: mt7927_init"
+# Check status — should show "Kernel driver in use: mt7927"
+lspci -k | grep -A 3 "14c3:7927"
+sudo dmesg | tail -30
 ```
 
 ## Technical Details
@@ -61,41 +78,51 @@ lspci -k | grep -A 3 "14c3:7927"  # Should show "Kernel driver in use: mt7927_in
 - **Current State**: FW_STATUS: 0xffff10f1 (waiting for DMA firmware transfer)
 
 ### Key Discoveries
-1. **MT7925 firmware is compatible** - No need to wait for MediaTek
-2. **Driver binding works** - Custom driver successfully claims device
-3. **Clear path forward** - Just need to implement DMA transfer mechanism
+1. **MT6639 firmware is required** - MT7925 firmware does NOT work for MT7927
+2. **CBInfra bus fabric** - CBTOP remap is mandatory before any DMA access
+3. **DMA rings are different** - RX at rings 4/6/7, not 0/1/2
+4. **CLR_OWN destroys DMA config** - Must be handled carefully
+5. **DBDC must be explicit** - Without it, only 2.4GHz works
+6. **ASPM must be disabled** - Causes severe throughput issues
 
-### What's Working ✅
+### What's Working
 - PCI enumeration and BAR mapping
-- Driver successfully binds to device
-- Firmware files load into kernel memory
-- All hardware registers accessible
+- CBTOP remap and CBInfra initialization
+- DMA ring allocation with correct MT7927 layout
+- Firmware loading via DMA ring 16
+- Driver registers as "mt7927" (not mt7925e)
 - Chip is stable and responsive
 
-### What's Not Working Yet ❌
-- DMA firmware transfer to chip (main blocker)
-- Memory activation at 0x000000
-- WiFi network interface creation
+### What's Not Working Yet
+- Full MCU command interface (needs mt76 infrastructure)
+- mac80211 integration (WiFi network interface)
+- DBDC dual-band enable command
+- Power management wake path
 
-### Why It's Not Working (Root Cause)
-The firmware loads into kernel memory but isn't transferred to the chip via DMA. We need to:
-1. Set up DMA descriptors properly
-2. Copy firmware with correct headers to DMA buffer
-3. Trigger MCU to read from DMA buffer
-4. Wait for firmware acknowledgment
+### Root Cause (now understood)
+The original blocker was the **CBInfra bus fabric**. MT7927 has a CBTOP
+(Combo Bus Top) layer between PCIe and the WFDMA engine. Without the
+remap sequence, all DMA register writes are silently dropped. The jetm
+DKMS project solved this with an 18-patch series against the in-kernel
+mt7925e driver.
 
 ## Project Structure
 ```
-mt7927-linux-driver/
-├── README.md                        # This file (main documentation)
-├── Makefile                         # Build system
-├── tests/
-│   ├── 04_risky_ops/
-│   │   ├── mt7927_wrapper.c        # ✅ Basic driver (binds successfully)
-│   │   ├── mt7927_init.c           # 🚧 Current driver (loads firmware)
-│   │   └── test_mt7925_firmware.c  # ✅ Firmware compatibility test
-│   └── Kbuild                       # Kernel build config
-└── src/                             # Future production driver location
+mt7927/
+├── README.md                        # This file
+├── Makefile                         # Build system (make driver / make tests)
+├── src/
+│   ├── mt7927.h                    # Hardware definitions, register map, DMA layout
+│   ├── mt7927_init.c               # CBTOP remap, chip init, DMA, firmware load
+│   └── Kbuild                      # Kernel build config
+├── tests/                           # Original test infrastructure (23 tests)
+│   ├── 01_safe_basic/              # PCI enumeration, BAR mapping, chip ID
+│   ├── 02_safe_discovery/          # Config space analysis
+│   ├── 03_careful_write/           # Memory activation attempts
+│   ├── 04_risky_ops/               # Legacy drivers (before CBInfra fix)
+│   └── tools/                      # Exploration tools
+└── docs/
+    └── TEST_RESULTS_SUMMARY.md     # Test results from discovery phase
 ```
 
 ## Development Roadmap
@@ -191,17 +218,23 @@ ls -la /lib/firmware/mediatek/mt7925/
 
 ## FAQ
 
-**Q: Why not just use the mt7925e driver?**  
-A: The mt7925e driver refuses to bind to MT7927's PCI ID (14c3:7927) and adding the ID via new_id fails with "Invalid argument".
+**Q: Why not just use the mt7925e driver?**
+A: The mt7925e driver refuses to bind to MT7927's PCI ID (14c3:7927). The [jetm/mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms) project patches mt7925e via DKMS and is the recommended working solution. This standalone driver is for development and learning.
 
-**Q: Is this safe to test?**  
-A: Yes, we're using proven MT7925 code paths. The worst case is the driver doesn't fully initialize (current state).
+**Q: Why does this driver show as "mt7927" instead of "mt7925e"?**
+A: This is a standalone driver that registers with PCI as "mt7927". When loaded, `lspci -k` shows `Kernel driver in use: mt7927`.
 
-**Q: Will this support full WiFi 7 320MHz channels?**  
-A: Initially it will work like MT7925 (160MHz). Adding 320MHz support will come after basic functionality works.
+**Q: What firmware do I need?**
+A: MT6639-based firmware from the ASUS driver package (NOT MT7925 firmware). The files are `WIFI_RAM_CODE_MT6639_2_1.bin` and `WIFI_MT6639_PATCH_MCU_2_1_hdr.bin`, installed to `/lib/firmware/mediatek/mt7927/`.
 
-**Q: When will this be in the mainline kernel?**  
-A: Once we have a working driver, submission typically takes 2-3 kernel cycles (3-6 months).
+**Q: Is this safe to test?**
+A: Yes. The worst case is the driver doesn't fully initialize. The chip remains stable.
+
+**Q: What was the main blocker?**
+A: The CBInfra bus fabric. MT7927 has a CBTOP layer that must be configured before DMA works. Without it, all DMA register writes are silently ignored.
+
+**Q: Will this support full WiFi 7 320MHz channels?**
+A: The register definitions include 320MHz support. Full implementation requires mac80211 integration.
 
 ## License
 GPL v2 - Intended for upstream Linux kernel submission
